@@ -103,6 +103,62 @@ function dbg(category, msg) {
   if (DBG_TG) { tgDebug(line); }
 }
 
+// Formatting helpers
+const fmt2 = (n) => new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(Number(n));
+
+// Known base tokens on BSC for spent detection
+const BASE_TOKENS = {
+  // address(lowercase): { symbol, decimals, alias }
+  '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c': { symbol: 'BNB', decimals: 18 }, // WBNB
+  '0x55d398326f99059ff775485246999027b3197955': { symbol: 'USDT', decimals: 18 },
+  '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d': { symbol: 'USDC', decimals: 18 }
+};
+
+async function detectSpent(provider, txHash, trackedFrom) {
+  try {
+    const [tx, receipt] = await Promise.all([
+      provider.getTransaction(txHash),
+      provider.getTransactionReceipt(txHash)
+    ]);
+
+    // 1) Native BNB spent
+    if (tx && tx.from && trackedFrom && tx.from.toLowerCase() === trackedFrom.toLowerCase()) {
+      const value = tx.value ?? 0n;
+      if (value > 0n) {
+        return { symbol: 'BNB', amount: Number(ethers.formatEther(value)) };
+      }
+    }
+
+    // 2) ERC-20 base/stable spent: sum transfers out of the tracked wallet
+    let best = null;
+    const transferTopic = TRANSFER_TOPIC;
+    for (const lg of receipt.logs || []) {
+      if (lg.topics && lg.topics.length >= 3 && lg.topics[0] === transferTopic) {
+        const tokenAddr = (lg.address || '').toLowerCase();
+        const base = BASE_TOKENS[tokenAddr];
+        if (!base) continue;
+        const from = ethers.getAddress(ethers.dataSlice(lg.topics[1], 12));
+        if (trackedFrom && from.toLowerCase() !== trackedFrom.toLowerCase()) continue;
+        const raw = ethers.getBigInt(lg.data);
+        const amt = Number(ethers.formatUnits(raw, base.decimals));
+        // pick the largest plausible base outflow as "spent"
+        if (!best || amt > best.amount) best = { symbol: base.symbol, amount: amt };
+      }
+    }
+    if (best) return best;
+  } catch (e) {
+    if (DBG_V) dbg('spent.error', e.message);
+  }
+  return null;
+}
+
+function formatAgeDays(secondsSinceEpoch) {
+  if (!secondsSinceEpoch) return '';
+  const ageSec = Math.max(0, Math.floor(Date.now() / 1000 - secondsSinceEpoch));
+  const days = ageSec / (24 * 3600);
+  return `${fmt2(days)}d`;
+}
+
 // Fail fast if chat is wrong (so you don’t miss alerts later)
 async function assertChat() {
   try {
