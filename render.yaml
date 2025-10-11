@@ -1,0 +1,40 @@
+services:
+  - type: worker
+    name: wallet-tracker
+    env: node
+    plan: starter
+    autoDeploy: true
+    buildCommand: npm ci
+    startCommand: node tracker.cjs
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHAT_ID
+        sync: false
+      - key: WSS_RPC_URL
+        sync: false
+      - key: HTTPS_RPC_URL
+        sync: false
+      - key: BSCSCAN_API_KEY
+        sync: false
+      - key: BITQUERY_API_KEY
+        sync: false
+      - key: FM_PROXY
+        value: 0x5c952063c7fc8610FFDB798152D69F0B9550762b
+      - key: FOUR_MEME_ONLY
+        value: "true"
+      - key: MIN_TOKEN_AGE_DAYS
+        value: "1"
+      - key: DEBUG_AGE
+        value: "false"
+      - key: DEBUG_FOURMEME
+        value: "false"
+      - key: DEBUG_TG
+        value: "false"
+      - key: DEBUG_TAP
+        value: "false"
+      - key: TAP_BLOCKS_BACK
+        value: "20"
+      - key: TAP_SAMPLE_LIMIT
+        value: "5"
+
