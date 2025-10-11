@@ -128,7 +128,7 @@ async function getCreationInfo(token, provider) {
 
   // 1) Prefer BscScan contract creation (fast) to get the block number, then fetch timestamp via QuickNode
   try {
-    const url = `https://api.bscscan.com/api?module=contract&action=getcontractcreation&contractaddresses=${addr}&apikey=${BSCSCAN_API_KEY}`;
+  const url = `https://api.bscscan.com/api?module=contract&action=getcontractcreation&contractaddresses=${addr}&apikey=${BSCSCAN_API_KEY}`;
     const res = await fetch(url);
     const json = await res.json();
     if (json.status === '1' && Array.isArray(json.result) && json.result.length) {
@@ -225,9 +225,9 @@ async function getCreationInfo(token, provider) {
           if (DBG_AGE) console.log(`[age] Bitquery creation for ${addr} -> block=${blockNumber}, ts=${timestamp}`);
           await tgDebug(`[age] Bitquery creation for ${addr} -> block=${blockNumber}, ts=${timestamp}`);
           const info = { blockNumber, timestamp, nextRetryAt: 0 };
-          createdCache.set(addr, info);
-          return info;
-        }
+      createdCache.set(addr, info);
+      return info;
+    }
       }
     } catch (e) {
       if (DBG_AGE) console.log(`[age] Bitquery creation query failed for ${addr}: ${e.message}`);
@@ -371,7 +371,7 @@ async function sendBuy({ token, symbol, name, amount, decimals, to, txHash, mcap
     `[Token Page](https://bscscan.com/token/${token})`
   ].filter(Boolean).join('\n');
   try {
-    await bot.telegram.sendMessage(CHAT_ID, text, { parse_mode: 'MarkdownV2', disable_web_page_preview: true });
+  await bot.telegram.sendMessage(CHAT_ID, text, { parse_mode: 'MarkdownV2', disable_web_page_preview: true });
   } catch (e) {
     console.error('sendBuy markdown error:', e?.response?.description || e.message);
     // Fallback: send plain text without markdown in case of parse issues
@@ -408,7 +408,7 @@ async function sendSell({ token, symbol, name, amount, decimals, from, txHash })
     `[Token Page](https://bscscan.com/token/${token})`
   ].join('\n');
   try {
-    await bot.telegram.sendMessage(CHAT_ID, text, { parse_mode: 'MarkdownV2', disable_web_page_preview: true });
+  await bot.telegram.sendMessage(CHAT_ID, text, { parse_mode: 'MarkdownV2', disable_web_page_preview: true });
   } catch (e) {
     console.error('sendSell markdown error:', e?.response?.description || e.message);
     const plain = [
@@ -433,85 +433,95 @@ function subscribeForWallets(provider) {
   // Simple per-wallet subscriptions (original working logic)
   const wallets = Array.from(TRACK);
   let subCount = 0;
+  const RATE_MS = 150; // ~13.3 subs/sec (2 per wallet), under QuickNode 15/sec limit
+  let i = 0;
 
   for (const w of wallets) {
     const addr32 = ethers.zeroPadValue(ethers.getAddress(w), 32);
+    const when = i * RATE_MS;
 
+    setTimeout(() => {
     // BUY = to == wallet
     const buyFilter = { address: undefined, topics: [ TRANSFER_TOPIC, null, addr32 ] };
-    console.log(`[sub] BUY filter for ${w}`);
+      console.log(`[sub] BUY filter for ${w} (+${when}ms)`);
     provider.on(buyFilter, async (log) => {
-    try {
-      console.log(`[BUY event] token=${log.address}, tx=${log.transactionHash}`);
-      await tgDebug(`[BUY event] token=${log.address}, tx=${log.transactionHash}`);
-      const from = ethers.getAddress(ethers.dataSlice(log.topics[1], 12));
-      const to   = ethers.getAddress(ethers.dataSlice(log.topics[2], 12));
-      if (!TRACK.has(to.toLowerCase())) return;
-
-      const token = ethers.getAddress(log.address);
-      if (FM_ONLY && !(await isFourMemeToken(token, provider))) {
-        if (DBG_FM) console.log(`[skip] not Four Meme: ${token}`);
-        await tgDebug(`[BUY skip] not Four Meme: ${token}`);
-        return;
-      }
-      if (!(await isTokenOldEnough(token, provider, MIN_WEEKS))) return;
-
-      const { symbol, name, decimals } = await getTokenMeta(token, provider);
-      // Fetch market cap from Dexscreener (best-effort)
-      let mcapUsd = null;
       try {
-        const ds = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${token}`).then(r => r.json());
-        const pairs = Array.isArray(ds?.pairs) ? ds.pairs : [];
-        const top = pairs[0];
-        const mcap = top?.fdv || top?.marketCap;
-        if (mcap && Number.isFinite(Number(mcap))) mcapUsd = Math.round(Number(mcap)).toLocaleString('en-US');
-      } catch {}
-      const amount = ethers.getBigInt(log.data);
-      const k = keyFor(token, log.transactionHash, from, to, amount, 'BUY');
-      if (seen.has(k)) return; if (seen.size > 5000) seen.clear(); seen.add(k);
-      await sendBuy({ token, symbol, name, amount, decimals, to, txHash: log.transactionHash, mcapUsd });
-      console.log(`[BUY sent] ${symbol} amount=${ethers.formatUnits(amount, decimals)} tx=${log.transactionHash}`);
-      await tgDebug(`[BUY sent] ${symbol} amount=${ethers.formatUnits(amount, decimals)} tx=${log.transactionHash}`);
-    } catch (err) {
-          console.error('buy handler error:', err.message);
-    }
+            console.log(`[BUY event] token=${log.address}, tx=${log.transactionHash}`);
+            await tgDebug(`[BUY event] token=${log.address}, tx=${log.transactionHash}`);
+        const from = ethers.getAddress(ethers.dataSlice(log.topics[1], 12));
+        const to   = ethers.getAddress(ethers.dataSlice(log.topics[2], 12));
+        if (!TRACK.has(to.toLowerCase())) return;
+
+        const token = ethers.getAddress(log.address);
+        if (FM_ONLY && !(await isFourMemeToken(token, provider))) {
+          if (DBG_FM) console.log(`[skip] not Four Meme: ${token}`);
+              await tgDebug(`[BUY skip] not Four Meme: ${token}`);
+          return;
+        }
+        if (!(await isTokenOldEnough(token, provider, MIN_WEEKS))) return;
+
+        const { symbol, name, decimals } = await getTokenMeta(token, provider);
+            // Fetch market cap from Dexscreener (best-effort)
+            let mcapUsd = null;
+            try {
+              const ds = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${token}`).then(r => r.json());
+              const pairs = Array.isArray(ds?.pairs) ? ds.pairs : [];
+              const top = pairs[0];
+              const mcap = top?.fdv || top?.marketCap;
+              if (mcap && Number.isFinite(Number(mcap))) mcapUsd = Math.round(Number(mcap)).toLocaleString('en-US');
+            } catch {}
+        const amount = ethers.getBigInt(log.data);
+        const k = keyFor(token, log.transactionHash, from, to, amount, 'BUY');
+        if (seen.has(k)) return; if (seen.size > 5000) seen.clear(); seen.add(k);
+            await sendBuy({ token, symbol, name, amount, decimals, to, txHash: log.transactionHash, mcapUsd });
+            console.log(`[BUY sent] ${symbol} amount=${ethers.formatUnits(amount, decimals)} tx=${log.transactionHash}`);
+            await tgDebug(`[BUY sent] ${symbol} amount=${ethers.formatUnits(amount, decimals)} tx=${log.transactionHash}`);
+      } catch (err) {
+        console.error('buy handler error:', err.message);
+      }
     });
-    subCount++;
+      subCount++;
 
     // SELL = from == wallet
     const sellFilter = { address: undefined, topics: [ TRANSFER_TOPIC, addr32, null ] };
-    console.log(`[sub] SELL filter for ${w}`);
+      console.log(`[sub] SELL filter for ${w} (+${when}ms)`);
     provider.on(sellFilter, async (log) => {
-    try {
-      console.log(`[SELL event] token=${log.address}, tx=${log.transactionHash}`);
-      await tgDebug(`[SELL event] token=${log.address}, tx=${log.transactionHash}`);
-      const from = ethers.getAddress(ethers.dataSlice(log.topics[1], 12));
-      const to   = ethers.getAddress(ethers.dataSlice(log.topics[2], 12));
-      if (!TRACK.has(from.toLowerCase())) return;
+      try {
+            console.log(`[SELL event] token=${log.address}, tx=${log.transactionHash}`);
+            await tgDebug(`[SELL event] token=${log.address}, tx=${log.transactionHash}`);
+        const from = ethers.getAddress(ethers.dataSlice(log.topics[1], 12));
+        const to   = ethers.getAddress(ethers.dataSlice(log.topics[2], 12));
+        if (!TRACK.has(from.toLowerCase())) return;
 
-      const token = ethers.getAddress(log.address);
-      if (FM_ONLY && !(await isFourMemeToken(token, provider))) {
-        if (DBG_FM) console.log(`[skip] not Four Meme: ${token}`);
-        await tgDebug(`[SELL skip] not Four Meme: ${token}`);
-        return;
+        const token = ethers.getAddress(log.address);
+        if (FM_ONLY && !(await isFourMemeToken(token, provider))) {
+          if (DBG_FM) console.log(`[skip] not Four Meme: ${token}`);
+              await tgDebug(`[SELL skip] not Four Meme: ${token}`);
+          return;
+        }
+        if (!(await isTokenOldEnough(token, provider, MIN_WEEKS))) return;
+
+        const { symbol, name, decimals } = await getTokenMeta(token, provider);
+        const amount = ethers.getBigInt(log.data);
+        const k = keyFor(token, log.transactionHash, from, to, amount, 'SELL');
+        if (seen.has(k)) return; if (seen.size > 5000) seen.clear(); seen.add(k);
+        await sendSell({ token, symbol, name, amount, decimals, from, txHash: log.transactionHash });
+            console.log(`[SELL sent] ${symbol} amount=${ethers.formatUnits(amount, decimals)} tx=${log.transactionHash}`);
+            await tgDebug(`[SELL sent] ${symbol} amount=${ethers.formatUnits(amount, decimals)} tx=${log.transactionHash}`);
+      } catch (err) {
+        console.error('sell handler error:', err.message);
       }
-      if (!(await isTokenOldEnough(token, provider, MIN_WEEKS))) return;
-
-      const { symbol, name, decimals } = await getTokenMeta(token, provider);
-      const amount = ethers.getBigInt(log.data);
-      const k = keyFor(token, log.transactionHash, from, to, amount, 'SELL');
-      if (seen.has(k)) return; if (seen.size > 5000) seen.clear(); seen.add(k);
-      await sendSell({ token, symbol, name, amount, decimals, from, txHash: log.transactionHash });
-      console.log(`[SELL sent] ${symbol} amount=${ethers.formatUnits(amount, decimals)} tx=${log.transactionHash}`);
-      await tgDebug(`[SELL sent] ${symbol} amount=${ethers.formatUnits(amount, decimals)} tx=${log.transactionHash}`);
-    } catch (err) {
-          console.error('sell handler error:', err.message);
-    }
     });
-    subCount++;
+      subCount++;
+    }, when);
+
+    i++;
   }
 
-  console.log(`Subscribed to ${TRACK.size} wallet(s) with ${subCount} filters. Waiting for incoming ERC-20 transfers…`);
+  console.log(`Scheduling ${wallets.length} wallet subscriptions at ~${Math.round(1000 / RATE_MS) * 2}/sec…`);
+  setTimeout(() => {
+    console.log(`Subscribed ~${subCount} filters (expected ${wallets.length * 2}). Waiting for incoming ERC-20 transfers…`);
+  }, i * RATE_MS + 500);
 }
 
 // Provider lifecycle with health-check & reconnect
