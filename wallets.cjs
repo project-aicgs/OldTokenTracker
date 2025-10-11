@@ -3,6 +3,7 @@
 
 const walletLabels = new Map([
   ['0x0000cf1edaf40a9350f2b649e19d811b05dbf138', 'flare'],
+  ['0xfdbd3867a9fe22d12979b65a0bac2c63db3872e2', 'specificz']
   ['0x00567d0e8187ee3ae5ea55b531fd436266b15d9e', 'facairiji'],
   ['0x0128550175d457e1095b3d9e18a1513e32a9bc54', 'base75'],
   ['0x04e6f2dd673fd089395b4ef7c3111da739826a62', 'apestoreinsider'],
