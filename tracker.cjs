@@ -159,6 +159,43 @@ function formatAgeDays(secondsSinceEpoch) {
   return `${fmt2(days)}d`;
 }
 
+async function detectReceivedBase(provider, txHash, trackedTo) {
+  try {
+    const receipt = await (provider.getTransactionReceipt(txHash));
+    let best = null;
+    const transferTopic = TRANSFER_TOPIC;
+    for (const lg of receipt.logs || []) {
+      if (lg.topics && lg.topics.length >= 3 && lg.topics[0] === transferTopic) {
+        const tokenAddr = (lg.address || '').toLowerCase();
+        const base = BASE_TOKENS[tokenAddr];
+        if (!base) continue;
+        const to = ethers.getAddress(ethers.dataSlice(lg.topics[2], 12));
+        if (trackedTo && to.toLowerCase() !== trackedTo.toLowerCase()) continue;
+        const raw = ethers.getBigInt(lg.data);
+        const amt = Number(ethers.formatUnits(raw, base.decimals));
+        if (!best || amt > best.amount) best = { symbol: base.symbol, amount: amt };
+      }
+    }
+    return best;
+  } catch (e) {
+    if (DBG_V) dbg('recv.error', e.message);
+    return null;
+  }
+}
+
+async function fetchMcapUsd(token) {
+  try {
+    const ds = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${token}`).then(r => r.json());
+    const pairs = Array.isArray(ds?.pairs) ? ds.pairs : [];
+    const top = pairs[0];
+    const mcap = top?.fdv || top?.marketCap;
+    if (mcap && Number.isFinite(Number(mcap))) return fmt2(Number(mcap));
+  } catch (e) {
+    if (DBG_V) dbg('mcap.error', e.message);
+  }
+  return null;
+}
+
 // Fail fast if chat is wrong (so you don’t miss alerts later)
 async function assertChat() {
   try {
@@ -446,21 +483,24 @@ function keyFor(token, txHash, from, to, value, side) {
 }
 
 // Telegram sends
-async function sendBuy({ token, symbol, name, amount, decimals, to, txHash, mcapUsd }) {
-  const human = ethers.formatUnits(amount, decimals);
+async function sendBuy({ token, symbol, name, amount, decimals, to, txHash, creationTs }) {
+  const humanNum = Number(ethers.formatUnits(amount, decimals));
   const label = walletLabels.get(to.toLowerCase()) || to;
   const labelLink = `[${esc(label)}](https://bscscan.com/address/${to})`;
-  const text = [
-    `*${esc(label)}* bought *${esc(symbol)}*`,
-    '',
-    `Token: *${esc(symbol)}* \\- ${esc(name)}`,
+  const spent = await detectReceivedBase(httpProvider || provider, txHash, to);
+  const mcapUsd = await fetchMcapUsd(token);
+  const ageStr = formatAgeDays(creationTs);
+
+  const sentence = `*${esc(label)}* bought *${esc(fmt2(humanNum))}* *${esc(symbol)}*${spent ? ` for *${esc(fmt2(spent.amount))}* ${esc(spent.symbol)}` : ''}`;
+  const details = [
+    `Token: *${esc(symbol)}* \\– ${esc(name)}`,
     `Contract: \`${esc(token)}\``,
-    `Amount: *${esc(human)}*`,
     `Wallet: ${labelLink}`,
     mcapUsd ? `MCap: *$${esc(mcapUsd)}*` : null,
-    `[View Tx](https://bscscan.com/tx/${txHash})`,
-    `[Token Page](https://bscscan.com/token/${token})`
+    ageStr ? `Age: *${esc(ageStr)}*` : null,
+    `[View Tx](https://bscscan.com/tx/${txHash})`
   ].filter(Boolean).join('\n');
+  const text = `${sentence}\n\n${details}`;
   try {
   await bot.telegram.sendMessage(CHAT_ID, text, { parse_mode: 'MarkdownV2', disable_web_page_preview: true });
   } catch (e) {
@@ -484,20 +524,21 @@ async function sendBuy({ token, symbol, name, amount, decimals, to, txHash, mcap
   }
 }
 
-async function sendSell({ token, symbol, name, amount, decimals, from, txHash }) {
-  const human = ethers.formatUnits(amount, decimals);
+async function sendSell({ token, symbol, name, amount, decimals, from, txHash, creationTs }) {
+  const humanNum = Number(ethers.formatUnits(amount, decimals));
   const label = walletLabels.get(from.toLowerCase()) || from;
   const labelLink = `[${esc(label)}](https://bscscan.com/address/${from})`;
-  const text = [
-    `*${esc(label)}* sold *${esc(symbol)}*`,
-    '',
-    `Token: *${esc(symbol)}* \\- ${esc(name)}`,
+  const spent = await detectSpent(httpProvider || provider, txHash, from);
+  const ageStr = formatAgeDays(creationTs);
+  const sentence = `*${esc(label)}* sold *${esc(fmt2(humanNum))}* *${esc(symbol)}*${spent ? ` for *${esc(fmt2(spent.amount))}* ${esc(spent.symbol)}` : ''}`;
+  const details = [
+    `Token: *${esc(symbol)}* \\– ${esc(name)}`,
     `Contract: \`${esc(token)}\``,
-    `Amount: *${esc(human)}*`,
     `From: ${labelLink}`,
-    `[View Tx](https://bscscan.com/tx/${txHash})`,
-    `[Token Page](https://bscscan.com/token/${token})`
-  ].join('\n');
+    ageStr ? `Age: *${esc(ageStr)}*` : null,
+    `[View Tx](https://bscscan.com/tx/${txHash})`
+  ].filter(Boolean).join('\n');
+  const text = `${sentence}\n\n${details}`;
   try {
   await bot.telegram.sendMessage(CHAT_ID, text, { parse_mode: 'MarkdownV2', disable_web_page_preview: true });
   } catch (e) {
@@ -557,7 +598,8 @@ function subscribeForWallets(provider) {
         const amount = ethers.getBigInt(log.data);
         const k = keyFor(token, log.transactionHash, from, to, amount, 'BUY');
         if (seen.has(k)) return; if (seen.size > 5000) seen.clear(); seen.add(k);
-        await sendBuy({ token, symbol, name, amount, decimals, to, txHash: log.transactionHash, mcapUsd: null });
+        const cr = createdCache.get(token) || {};
+        await sendBuy({ token, symbol, name, amount, decimals, to, txHash: log.transactionHash, creationTs: cr.timestamp || null });
       } catch (err) {
         console.error('buy handler error:', err.message);
         if (DBG_V) dbg('buy.error', err.stack || err.message);
@@ -590,7 +632,8 @@ function subscribeForWallets(provider) {
         const amount = ethers.getBigInt(log.data);
         const k = keyFor(token, log.transactionHash, from, to, amount, 'SELL');
         if (seen.has(k)) return; if (seen.size > 5000) seen.clear(); seen.add(k);
-        await sendSell({ token, symbol, name, amount, decimals, from, txHash: log.transactionHash });
+        const cr = createdCache.get(token) || {};
+        await sendSell({ token, symbol, name, amount, decimals, from, txHash: log.transactionHash, creationTs: cr.timestamp || null });
       } catch (err) {
         console.error('sell handler error:', err.message);
         if (DBG_V) dbg('sell.error', err.stack || err.message);
