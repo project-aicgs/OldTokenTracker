@@ -28,6 +28,7 @@ const { walletLabels } = require('./wallets.cjs');
    DEBUG_TAP=false                 # Optional: global Transfer tap + block logs
    TAP_BLOCKS_BACK=20              # Optional: how many recent blocks to probe for logs
    TAP_SAMPLE_LIMIT=5              # Optional: sample size to print from recent logs
+   SUBSCRIBE_RATE=10               # Subscriptions per second (throttle per-wallet filters)
 */
 
 const {
@@ -47,7 +48,8 @@ const {
   DEBUG_TG = 'false',
   DEBUG_TAP = 'false',
   TAP_BLOCKS_BACK = '20',
-  TAP_SAMPLE_LIMIT = '5'
+  TAP_SAMPLE_LIMIT = '5',
+  SUBSCRIBE_RATE = '10'
 } = process.env;
 
 if (!BOT_TOKEN || !CHAT_ID || !WSS_RPC_URL || !BSCSCAN_API_KEY) {
@@ -64,6 +66,7 @@ const DBG_TG = String(DEBUG_TG).toLowerCase() === 'true';
 const DBG_TAP = String(DEBUG_TAP).toLowerCase() === 'true';
 const TAP_BACK = Math.max(0, parseInt(TAP_BLOCKS_BACK, 10) || 0);
 const TAP_SAMPLES = Math.max(0, parseInt(TAP_SAMPLE_LIMIT, 10) || 0);
+const SUBS_RATE = Math.max(1, parseInt(SUBSCRIBE_RATE, 10) || 10);
 const TRACK = new Set(Array.from(walletLabels.keys()));
 
 // --- Telegram ---
@@ -411,20 +414,20 @@ async function sendSell({ token, symbol, name, amount, decimals, from, txHash })
 
 // Subscribe handlers
 function subscribeForWallets(provider) {
-  // Chunk OR-topic arrays to avoid provider limits; keep total subs small
-  const addr32List = Array.from(TRACK).map(w => ethers.zeroPadValue(ethers.getAddress(w), 32));
-  const MAX_TOPICS_IN_OR = 50; // tune if provider supports more
-  const chunks = [];
-  for (let i = 0; i < addr32List.length; i += MAX_TOPICS_IN_OR) {
-    chunks.push(addr32List.slice(i, i + MAX_TOPICS_IN_OR));
-  }
-
+  // Revert to per-wallet subscriptions, throttled to avoid provider limits
+  const wallets = Array.from(TRACK);
+  const delayMs = Math.floor(1000 / SUBS_RATE);
+  let idx = 0;
   let subCount = 0;
 
-  // BUY = to ∈ TRACK (chunked)
-  for (const chunk of chunks) {
-    const buyFilter = { address: undefined, topics: [ TRANSFER_TOPIC, null, chunk ] };
-    provider.on(buyFilter, async (log) => {
+  for (const w of wallets) {
+    const when = idx * delayMs;
+    const addr32 = ethers.zeroPadValue(ethers.getAddress(w), 32);
+    setTimeout(() => {
+      // BUY = to == wallet
+      const buyFilter = { address: undefined, topics: [ TRANSFER_TOPIC, null, addr32 ] };
+      console.log(`[sub] BUY filter for ${w} at +${when}ms`);
+      provider.on(buyFilter, async (log) => {
     try {
       console.log(`[BUY event] token=${log.address}, tx=${log.transactionHash}`);
       await tgDebug(`[BUY event] token=${log.address}, tx=${log.transactionHash}`);
@@ -457,16 +460,15 @@ function subscribeForWallets(provider) {
       console.log(`[BUY sent] ${symbol} amount=${ethers.formatUnits(amount, decimals)} tx=${log.transactionHash}`);
       await tgDebug(`[BUY sent] ${symbol} amount=${ethers.formatUnits(amount, decimals)} tx=${log.transactionHash}`);
     } catch (err) {
-      console.error('buy handler error:', err.message);
+          console.error('buy handler error:', err.message);
     }
-    });
-    subCount++;
-  }
+      });
+      subCount++;
 
-  // SELL = from ∈ TRACK (chunked)
-  for (const chunk of chunks) {
-    const sellFilter = { address: undefined, topics: [ TRANSFER_TOPIC, chunk, null ] };
-    provider.on(sellFilter, async (log) => {
+      // SELL = from == wallet
+      const sellFilter = { address: undefined, topics: [ TRANSFER_TOPIC, addr32, null ] };
+      console.log(`[sub] SELL filter for ${w} at +${when}ms`);
+      provider.on(sellFilter, async (log) => {
     try {
       console.log(`[SELL event] token=${log.address}, tx=${log.transactionHash}`);
       await tgDebug(`[SELL event] token=${log.address}, tx=${log.transactionHash}`);
@@ -490,13 +492,19 @@ function subscribeForWallets(provider) {
       console.log(`[SELL sent] ${symbol} amount=${ethers.formatUnits(amount, decimals)} tx=${log.transactionHash}`);
       await tgDebug(`[SELL sent] ${symbol} amount=${ethers.formatUnits(amount, decimals)} tx=${log.transactionHash}`);
     } catch (err) {
-      console.error('sell handler error:', err.message);
+          console.error('sell handler error:', err.message);
     }
-    });
-    subCount++;
+      });
+      subCount++;
+    }, when);
+    idx++;
   }
 
-  console.log(`Subscribed to ${TRACK.size} wallet(s) with ${subCount} subscription(s). Waiting for incoming ERC-20 transfers…`);
+  console.log(`Scheduling subscriptions for ${TRACK.size} wallet(s) at ${SUBS_RATE}/sec (${delayMs}ms spacing)…`);
+  // Report final sub count after the last timer should have fired
+  setTimeout(() => {
+    console.log(`Subscribed with ~${subCount} active filters (expected ${TRACK.size * 2}). Waiting for incoming ERC-20 transfers…`);
+  }, (idx + 1) * delayMs + 500);
 }
 
 // Provider lifecycle with health-check & reconnect
