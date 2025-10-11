@@ -5,7 +5,6 @@ require('dotenv').config();
 const { Telegraf } = require('telegraf');
 const { ethers } = require('ethers');
 const fetch = require('node-fetch');
-const { walletLabels } = require('./wallets.cjs');
 
 /* =========================
    ENVIRONMENT VARIABLES
@@ -64,11 +63,10 @@ const DBG_TG = String(DEBUG_TG).toLowerCase() === 'true';
 const DBG_TAP = String(DEBUG_TAP).toLowerCase() === 'true';
 const TAP_BACK = Math.max(0, parseInt(TAP_BLOCKS_BACK, 10) || 0);
 const TAP_SAMPLES = Math.max(0, parseInt(TAP_SAMPLE_LIMIT, 10) || 0);
-// Union env-provided wallets with local wallet file (minimal behavior change)
-const TRACK = new Set([
-  ...Array.from(walletLabels.keys()),
-  ...((WALLETS && WALLETS.trim()) ? WALLETS.split(',').map(s => s.trim().toLowerCase()).filter(Boolean) : [])
-]);
+// Use only WALLETS env (comma-separated addresses)
+const TRACK = new Set((WALLETS && WALLETS.trim())
+  ? WALLETS.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+  : []);
 
 // --- Telegram ---
 const bot = new Telegraf(BOT_TOKEN);
