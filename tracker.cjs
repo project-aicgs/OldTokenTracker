@@ -411,12 +411,20 @@ async function sendSell({ token, symbol, name, amount, decimals, from, txHash })
 
 // Subscribe handlers
 function subscribeForWallets(provider) {
-  // Two subscriptions total using OR-topic arrays to avoid rate limits
+  // Chunk OR-topic arrays to avoid provider limits; keep total subs small
   const addr32List = Array.from(TRACK).map(w => ethers.zeroPadValue(ethers.getAddress(w), 32));
+  const MAX_TOPICS_IN_OR = 50; // tune if provider supports more
+  const chunks = [];
+  for (let i = 0; i < addr32List.length; i += MAX_TOPICS_IN_OR) {
+    chunks.push(addr32List.slice(i, i + MAX_TOPICS_IN_OR));
+  }
 
-  // BUY = to ∈ TRACK
-  const buyFilter = { address: undefined, topics: [ TRANSFER_TOPIC, null, addr32List ] };
-  provider.on(buyFilter, async (log) => {
+  let subCount = 0;
+
+  // BUY = to ∈ TRACK (chunked)
+  for (const chunk of chunks) {
+    const buyFilter = { address: undefined, topics: [ TRANSFER_TOPIC, null, chunk ] };
+    provider.on(buyFilter, async (log) => {
     try {
       console.log(`[BUY event] token=${log.address}, tx=${log.transactionHash}`);
       await tgDebug(`[BUY event] token=${log.address}, tx=${log.transactionHash}`);
@@ -451,11 +459,14 @@ function subscribeForWallets(provider) {
     } catch (err) {
       console.error('buy handler error:', err.message);
     }
-  });
+    });
+    subCount++;
+  }
 
-  // SELL = from ∈ TRACK
-  const sellFilter = { address: undefined, topics: [ TRANSFER_TOPIC, addr32List, null ] };
-  provider.on(sellFilter, async (log) => {
+  // SELL = from ∈ TRACK (chunked)
+  for (const chunk of chunks) {
+    const sellFilter = { address: undefined, topics: [ TRANSFER_TOPIC, chunk, null ] };
+    provider.on(sellFilter, async (log) => {
     try {
       console.log(`[SELL event] token=${log.address}, tx=${log.transactionHash}`);
       await tgDebug(`[SELL event] token=${log.address}, tx=${log.transactionHash}`);
@@ -481,9 +492,11 @@ function subscribeForWallets(provider) {
     } catch (err) {
       console.error('sell handler error:', err.message);
     }
-  });
+    });
+    subCount++;
+  }
 
-  console.log(`Subscribed to ${TRACK.size} wallet(s) with 2 subscriptions. Waiting for incoming ERC-20 transfers…`);
+  console.log(`Subscribed to ${TRACK.size} wallet(s) with ${subCount} subscription(s). Waiting for incoming ERC-20 transfers…`);
 }
 
 // Provider lifecycle with health-check & reconnect
