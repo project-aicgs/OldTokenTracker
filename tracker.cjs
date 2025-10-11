@@ -5,6 +5,7 @@ require('dotenv').config();
 const { Telegraf } = require('telegraf');
 const { ethers } = require('ethers');
 const fetch = require('node-fetch');
+const { walletLabels } = require('./wallets.cjs');
 
 /* =========================
    ENVIRONMENT VARIABLES
@@ -27,6 +28,11 @@ const fetch = require('node-fetch');
    DEBUG_TAP=false                 # Optional: global Transfer tap + block logs
    TAP_BLOCKS_BACK=20              # Optional: how many recent blocks to probe for logs
    TAP_SAMPLE_LIMIT=5              # Optional: sample size to print from recent logs
+   DEBUG_VERBOSE=false             # Optional: very detailed step-by-step debug
+   CHUNK_SIZE=50                   # Optional: wallets per OR-topic chunk (for large lists)
+   ATTACH_SPACING_MS=250           # Optional: ms spacing between chunk attaches
+   BACKFILL_BLOCKS=25              # Optional: backfill last N blocks per chunk after subscribe
+   QUICKNODE_PACE_MS=100           # Optional: min ms between HTTPS RPC calls (rate-limit)
 */
 
 const {
@@ -36,8 +42,8 @@ const {
   BSCSCAN_API_KEY,
   HTTPS_RPC_URL = '',
   WALLETS,
-  MIN_TOKEN_AGE_DAYS = '0',
-  MIN_TOKEN_AGE_WEEKS = '1',
+  MIN_TOKEN_AGE_DAYS = '1',
+  MIN_TOKEN_AGE_WEEKS = '0',
   FOUR_MEME_ONLY = 'false',
   FM_PROXY = '0x5c952063c7fc8610FFDB798152D69F0B9550762b',
   BITQUERY_API_KEY = 'its ',
@@ -61,12 +67,22 @@ const DBG_AGE = String(DEBUG_AGE).toLowerCase() === 'true';
 const DBG_FM = String(DEBUG_FOURMEME).toLowerCase() === 'true';
 const DBG_TG = String(DEBUG_TG).toLowerCase() === 'true';
 const DBG_TAP = String(DEBUG_TAP).toLowerCase() === 'true';
+const DBG_V = String(process.env.DEBUG_VERBOSE || '').toLowerCase() === 'true';
+const CHUNK_N = Math.max(5, parseInt(process.env.CHUNK_SIZE || '50', 10));
+const ATTACH_MS = Math.max(50, parseInt(process.env.ATTACH_SPACING_MS || '250', 10));
+const _RAW_BF = Math.max(0, parseInt(process.env.BACKFILL_BLOCKS || '25', 10));
+const _BF_LIMIT = 5; // QuickNode Discover limits eth_getLogs to ~5-block ranges
+const BF_BLOCKS = Math.min(_BF_LIMIT, _RAW_BF);
+if (DBG_V && _RAW_BF > _BF_LIMIT) {
+  console.log(`[backfill.cap] requested=${_RAW_BF} capped=${BF_BLOCKS}`);
+}
+const QN_PACE_MS = Math.max(0, parseInt(process.env.QUICKNODE_PACE_MS || '100', 10));
 const TAP_BACK = Math.max(0, parseInt(TAP_BLOCKS_BACK, 10) || 0);
 const TAP_SAMPLES = Math.max(0, parseInt(TAP_SAMPLE_LIMIT, 10) || 0);
-// Use only WALLETS env (comma-separated addresses)
+// Prefer env-provided wallets; fallback to local wallet file
 const TRACK = new Set((WALLETS && WALLETS.trim())
   ? WALLETS.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
-  : []);
+  : Array.from(walletLabels.keys()));
 
 // --- Telegram ---
 const bot = new Telegraf(BOT_TOKEN);
@@ -79,6 +95,12 @@ async function tgDebug(msg) {
   } catch (e) {
     console.warn('tgDebug failed:', e.message);
   }
+}
+
+function dbg(category, msg) {
+  const line = `[${category}] ${msg}`;
+  console.log(line);
+  if (DBG_TG) { tgDebug(line); }
 }
 
 // Fail fast if chat is wrong (so you don’t miss alerts later)
@@ -126,21 +148,26 @@ async function getCreationInfo(token, provider) {
 
   // 1) Prefer BscScan contract creation (fast) to get the block number, then fetch timestamp via QuickNode
   try {
-  const url = `https://api.bscscan.com/api?module=contract&action=getcontractcreation&contractaddresses=${addr}&apikey=${BSCSCAN_API_KEY}`;
+    const url = `https://api.bscscan.com/api?module=contract&action=getcontractcreation&contractaddresses=${addr}&apikey=${BSCSCAN_API_KEY}`;
     const res = await fetch(url);
     const json = await res.json();
+    if (DBG_V) dbg('age.query', `bscscan status=${json.status} message=${json.message}`);
     if (json.status === '1' && Array.isArray(json.result) && json.result.length) {
       const row = json.result[0];
       const blockNumber = parseInt(row.blockNumber, 10);
+      if (DBG_V) dbg('age.block', `creationBlock=${blockNumber}`);
       let timestamp = null;
       try {
         const useProvider = httpProvider || provider;
+        if (QN_PACE_MS) await new Promise(r => setTimeout(r, QN_PACE_MS));
         const block = await useProvider.getBlock(blockNumber);
         timestamp = block?.timestamp ?? null;
+        if (DBG_V) dbg('age.ts.provider', `ts=${timestamp}`);
         if (DBG_AGE && timestamp) console.log(`[age] Provider block ts for ${addr}@${blockNumber} -> ${timestamp}`);
         if (timestamp) await tgDebug(`[age] Provider block ts for ${addr}@${blockNumber} -> ${timestamp}`);
       } catch (e) {
         if (DBG_AGE) console.log(`[age] provider.getBlock failed for ${addr} @ ${blockNumber}: ${e.message}`);
+        if (DBG_V) dbg('age.ts.provider.error', e.message);
         await tgDebug(`[age] provider.getBlock failed for ${addr} @ ${blockNumber}: ${e.message}`);
       }
       if (!timestamp) {
@@ -154,11 +181,13 @@ async function getCreationInfo(token, provider) {
           }
           if (Number.isFinite(ts)) {
             timestamp = ts;
+            if (DBG_V) dbg('age.ts.bscscan', `ts=${timestamp}`);
             if (DBG_AGE) console.log(`[age] BscScan block ts for ${addr}@${blockNumber} -> ${timestamp}`);
             await tgDebug(`[age] BscScan block ts for ${addr}@${blockNumber} -> ${timestamp}`);
           }
         } catch (e) {
           if (DBG_AGE) console.log(`[age] BscScan timestamp fallback failed for ${addr} @ ${blockNumber}: ${e.message}`);
+          if (DBG_V) dbg('age.ts.bscscan.error', e.message);
           await tgDebug(`[age] BscScan timestamp fallback failed for ${addr} @ ${blockNumber}: ${e.message}`);
         }
       }
@@ -168,6 +197,7 @@ async function getCreationInfo(token, provider) {
     }
   } catch (e) {
     if (DBG_AGE) console.log(`[age] getcontractcreation failed for ${addr}: ${e.message}`);
+    if (DBG_V) dbg('age.query.error', e.message);
     await tgDebug(`[age] getcontractcreation failed for ${addr}: ${e.message}`);
   }
 
@@ -175,17 +205,23 @@ async function getCreationInfo(token, provider) {
   if (httpProvider) {
     try {
       const latest = await httpProvider.getBlockNumber();
+      if (DBG_V) dbg('age.rpc.latest', `latest=${latest}`);
       const codeLatest = await httpProvider.getCode(addr, latest);
+      if (DBG_V) dbg('age.rpc.codeLatest', `hasCode=${!!codeLatest && codeLatest !== '0x'}`);
       if (codeLatest && codeLatest !== '0x') {
         let low = 0, high = latest;
         while (low < high) {
           const mid = Math.floor((low + high) / 2);
+          if (QN_PACE_MS) await new Promise(r => setTimeout(r, QN_PACE_MS));
           const code = await httpProvider.getCode(addr, mid);
+          if (DBG_V) dbg('age.rpc.mid', `mid=${mid} hasCode=${!!code && code !== '0x'}`);
           if (code && code !== '0x') high = mid; else low = mid + 1;
         }
         const firstBlock = low;
+        if (QN_PACE_MS) await new Promise(r => setTimeout(r, QN_PACE_MS));
         const block = await httpProvider.getBlock(firstBlock);
         const timestamp = block?.timestamp ?? null;
+        if (DBG_V) dbg('age.rpc.result', `firstBlock=${firstBlock} ts=${timestamp}`);
         if (Number.isFinite(firstBlock) && Number.isFinite(timestamp)) {
           if (DBG_AGE) console.log(`[age] Archive RPC creation for ${addr} -> block=${firstBlock}, ts=${timestamp}`);
           await tgDebug(`[age] Archive RPC creation for ${addr} -> block=${firstBlock}, ts=${timestamp}`);
@@ -196,6 +232,7 @@ async function getCreationInfo(token, provider) {
       }
     } catch (e) {
       if (DBG_AGE) console.log(`[age] Archive RPC search failed for ${addr}: ${e.message}`);
+      if (DBG_V) dbg('age.rpc.error', e.message);
       await tgDebug(`[age] Archive RPC search failed for ${addr}: ${e.message}`);
     }
   }
@@ -223,9 +260,9 @@ async function getCreationInfo(token, provider) {
           if (DBG_AGE) console.log(`[age] Bitquery creation for ${addr} -> block=${blockNumber}, ts=${timestamp}`);
           await tgDebug(`[age] Bitquery creation for ${addr} -> block=${blockNumber}, ts=${timestamp}`);
           const info = { blockNumber, timestamp, nextRetryAt: 0 };
-      createdCache.set(addr, info);
-      return info;
-    }
+          createdCache.set(addr, info);
+          return info;
+        }
       }
     } catch (e) {
       if (DBG_AGE) console.log(`[age] Bitquery creation query failed for ${addr}: ${e.message}`);
@@ -428,24 +465,125 @@ async function sendSell({ token, symbol, name, amount, decimals, from, txHash })
 
 // Subscribe handlers
 function subscribeForWallets(provider) {
-  // Simple per-wallet subscriptions (original working logic)
   const wallets = Array.from(TRACK);
+
+  // For up to CHUNK_N wallets per chunk, create 2 OR-topic subs per chunk with staggering and optional backfill
+  if (wallets.length > 0) {
+    const addr32List = wallets.map(w => ethers.zeroPadValue(ethers.getAddress(w), 32));
+    const chunks = [];
+    for (let i = 0; i < addr32List.length; i += CHUNK_N) chunks.push(addr32List.slice(i, i + CHUNK_N));
+    console.log(`Subscribing ${chunks.length} chunk(s), chunk_size=${CHUNK_N}, attach_spacing_ms=${ATTACH_MS}, backfill_blocks=${BF_BLOCKS}`);
+    chunks.forEach((chunk, idx) => {
+      const delay = idx * ATTACH_MS;
+      setTimeout(() => {
+        // BUY
+        const buyFilter = { address: undefined, topics: [ TRANSFER_TOPIC, null, chunk ] };
+        provider.on(buyFilter, async (log) => {
+      try {
+        if (DBG_V) dbg('buy.event', `token=${log.address} tx=${log.transactionHash} topics=${JSON.stringify(log.topics)} dataLen=${(log.data||'').length}`);
+        const from = ethers.getAddress(ethers.dataSlice(log.topics[1], 12));
+        const to   = ethers.getAddress(ethers.dataSlice(log.topics[2], 12));
+        if (DBG_V) dbg('buy.roles', `from=${from} to=${to} tracked=${TRACK.has(to.toLowerCase())}`);
+        if (!TRACK.has(to.toLowerCase())) return;
+
+        const token = ethers.getAddress(log.address);
+        if (FM_ONLY) {
+          const fm = await isFourMemeToken(token, provider);
+          if (DBG_V) dbg('buy.fm', `FM_ONLY=${FM_ONLY} isFM=${fm}`);
+          if (!fm) return;
+        }
+        const ageOk = await isTokenOldEnough(token, provider, MIN_WEEKS);
+        if (DBG_V) dbg('buy.age', `ageOk=${ageOk}`);
+        if (!ageOk) return;
+
+        const { symbol, name, decimals } = await getTokenMeta(token, provider);
+        if (DBG_V) dbg('buy.meta', `symbol=${symbol} name=${name} decimals=${decimals}`);
+        const amount = ethers.getBigInt(log.data);
+        const k = keyFor(token, log.transactionHash, from, to, amount, 'BUY');
+        if (seen.has(k)) return; if (seen.size > 5000) seen.clear(); seen.add(k);
+        await sendBuy({ token, symbol, name, amount, decimals, to, txHash: log.transactionHash, mcapUsd: null });
+      } catch (err) {
+        console.error('buy handler error:', err.message);
+        if (DBG_V) dbg('buy.error', err.stack || err.message);
+      }
+        });
+        
+        // SELL (staggered)
+        setTimeout(() => {
+          const sellFilter = { address: undefined, topics: [ TRANSFER_TOPIC, chunk, null ] };
+          provider.on(sellFilter, async (log) => {
+      try {
+        if (DBG_V) dbg('sell.event', `token=${log.address} tx=${log.transactionHash} topics=${JSON.stringify(log.topics)} dataLen=${(log.data||'').length}`);
+        const from = ethers.getAddress(ethers.dataSlice(log.topics[1], 12));
+        const to   = ethers.getAddress(ethers.dataSlice(log.topics[2], 12));
+        if (DBG_V) dbg('sell.roles', `from=${from} to=${to} tracked=${TRACK.has(from.toLowerCase())}`);
+        if (!TRACK.has(from.toLowerCase())) return;
+
+        const token = ethers.getAddress(log.address);
+        if (FM_ONLY) {
+          const fm = await isFourMemeToken(token, provider);
+          if (DBG_V) dbg('sell.fm', `FM_ONLY=${FM_ONLY} isFM=${fm}`);
+          if (!fm) return;
+        }
+        const ageOk = await isTokenOldEnough(token, provider, MIN_WEEKS);
+        if (DBG_V) dbg('sell.age', `ageOk=${ageOk}`);
+        if (!ageOk) return;
+
+        const { symbol, name, decimals } = await getTokenMeta(token, provider);
+        if (DBG_V) dbg('sell.meta', `symbol=${symbol} name=${name} decimals=${decimals}`);
+        const amount = ethers.getBigInt(log.data);
+        const k = keyFor(token, log.transactionHash, from, to, amount, 'SELL');
+        if (seen.has(k)) return; if (seen.size > 5000) seen.clear(); seen.add(k);
+        await sendSell({ token, symbol, name, amount, decimals, from, txHash: log.transactionHash });
+      } catch (err) {
+        console.error('sell handler error:', err.message);
+        if (DBG_V) dbg('sell.error', err.stack || err.message);
+      }
+          });
+        }, Math.floor(ATTACH_MS / 2));
+
+        // Optional backfill after both filters attach
+        if (BF_BLOCKS > 0) {
+          setTimeout(async () => {
+            try {
+              const toBlock = await provider.getBlockNumber();
+              const fromBlock = Math.max(0, toBlock - BF_BLOCKS);
+              const logs = await provider.getLogs({ fromBlock, toBlock, topics: [ TRANSFER_TOPIC, null, chunk ] });
+              if (DBG_V) dbg('backfill.buy', `chunk=${idx} logs=${logs.length} from=${fromBlock} to=${toBlock}`);
+              for (const log of logs) {
+                // re-emit into same handler path
+                provider.emit(buyFilter, log);
+              }
+              const logs2 = await provider.getLogs({ fromBlock, toBlock, topics: [ TRANSFER_TOPIC, chunk, null ] });
+              if (DBG_V) dbg('backfill.sell', `chunk=${idx} logs=${logs2.length} from=${fromBlock} to=${toBlock}`);
+              for (const log of logs2) {
+                provider.emit({ address: undefined, topics: [ TRANSFER_TOPIC, chunk, null ] }, log);
+              }
+            } catch (e) {
+              if (DBG_V) dbg('backfill.error', e.message);
+            }
+          }, ATTACH_MS);
+        }
+
+        console.log(`Subscribed chunk ${idx + 1}/${chunks.length} (size=${chunk.length})`);
+      }, delay);
+    });
+    return;
+  }
+
+  // Per-wallet subscriptions (fallback for larger lists)
   let subCount = 0;
-  const RATE_MS = 300; // ~6.6 wallets/sec; with staggered BUY/SELL -> ~6.6*2=13.3 subs/sec
-  let i = 0;
 
   for (const w of wallets) {
     const addr32 = ethers.zeroPadValue(ethers.getAddress(w), 32);
-    const when = i * RATE_MS;
 
-    setTimeout(() => {
     // BUY = to == wallet
     const buyFilter = { address: undefined, topics: [ TRANSFER_TOPIC, null, addr32 ] };
-      console.log(`[sub] BUY filter for ${w} (+${when}ms)`);
+    console.log(`[sub] BUY filter for ${w}`);
     provider.on(buyFilter, async (log) => {
       try {
-            console.log(`[BUY event] token=${log.address}, tx=${log.transactionHash}`);
-            await tgDebug(`[BUY event] token=${log.address}, tx=${log.transactionHash}`);
+      console.log(`[BUY event] token=${log.address}, tx=${log.transactionHash}`);
+      await tgDebug(`[BUY event] token=${log.address}, tx=${log.transactionHash}`);
         const from = ethers.getAddress(ethers.dataSlice(log.topics[1], 12));
         const to   = ethers.getAddress(ethers.dataSlice(log.topics[2], 12));
         if (!TRACK.has(to.toLowerCase())) return;
@@ -453,44 +591,40 @@ function subscribeForWallets(provider) {
         const token = ethers.getAddress(log.address);
         if (FM_ONLY && !(await isFourMemeToken(token, provider))) {
           if (DBG_FM) console.log(`[skip] not Four Meme: ${token}`);
-              await tgDebug(`[BUY skip] not Four Meme: ${token}`);
+        await tgDebug(`[BUY skip] not Four Meme: ${token}`);
           return;
         }
         if (!(await isTokenOldEnough(token, provider, MIN_WEEKS))) return;
 
         const { symbol, name, decimals } = await getTokenMeta(token, provider);
-            // Fetch market cap from Dexscreener (best-effort)
-            let mcapUsd = null;
-            try {
-              const ds = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${token}`).then(r => r.json());
-              const pairs = Array.isArray(ds?.pairs) ? ds.pairs : [];
-              const top = pairs[0];
-              const mcap = top?.fdv || top?.marketCap;
-              if (mcap && Number.isFinite(Number(mcap))) mcapUsd = Math.round(Number(mcap)).toLocaleString('en-US');
-            } catch {}
+      // Fetch market cap from Dexscreener (best-effort)
+      let mcapUsd = null;
+      try {
+        const ds = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${token}`).then(r => r.json());
+        const pairs = Array.isArray(ds?.pairs) ? ds.pairs : [];
+        const top = pairs[0];
+        const mcap = top?.fdv || top?.marketCap;
+        if (mcap && Number.isFinite(Number(mcap))) mcapUsd = Math.round(Number(mcap)).toLocaleString('en-US');
+      } catch {}
         const amount = ethers.getBigInt(log.data);
         const k = keyFor(token, log.transactionHash, from, to, amount, 'BUY');
         if (seen.has(k)) return; if (seen.size > 5000) seen.clear(); seen.add(k);
-            await sendBuy({ token, symbol, name, amount, decimals, to, txHash: log.transactionHash, mcapUsd });
-            console.log(`[BUY sent] ${symbol} amount=${ethers.formatUnits(amount, decimals)} tx=${log.transactionHash}`);
-            await tgDebug(`[BUY sent] ${symbol} amount=${ethers.formatUnits(amount, decimals)} tx=${log.transactionHash}`);
+      await sendBuy({ token, symbol, name, amount, decimals, to, txHash: log.transactionHash, mcapUsd });
+      console.log(`[BUY sent] ${symbol} amount=${ethers.formatUnits(amount, decimals)} tx=${log.transactionHash}`);
+      await tgDebug(`[BUY sent] ${symbol} amount=${ethers.formatUnits(amount, decimals)} tx=${log.transactionHash}`);
       } catch (err) {
         console.error('buy handler error:', err.message);
       }
     });
-      subCount++;
+    subCount++;
 
-    }, when);
-
-    // Stagger SELL half-interval after BUY to smooth bursts
-    setTimeout(() => {
-      // SELL = from == wallet
-      const sellFilter = { address: undefined, topics: [ TRANSFER_TOPIC, addr32, null ] };
-      console.log(`[sub] SELL filter for ${w} (+${when + Math.floor(RATE_MS/2)}ms)`);
-      provider.on(sellFilter, async (log) => {
+    // SELL = from == wallet
+    const sellFilter = { address: undefined, topics: [ TRANSFER_TOPIC, addr32, null ] };
+    console.log(`[sub] SELL filter for ${w}`);
+    provider.on(sellFilter, async (log) => {
       try {
-            console.log(`[SELL event] token=${log.address}, tx=${log.transactionHash}`);
-            await tgDebug(`[SELL event] token=${log.address}, tx=${log.transactionHash}`);
+      console.log(`[SELL event] token=${log.address}, tx=${log.transactionHash}`);
+      await tgDebug(`[SELL event] token=${log.address}, tx=${log.transactionHash}`);
         const from = ethers.getAddress(ethers.dataSlice(log.topics[1], 12));
         const to   = ethers.getAddress(ethers.dataSlice(log.topics[2], 12));
         if (!TRACK.has(from.toLowerCase())) return;
@@ -498,7 +632,7 @@ function subscribeForWallets(provider) {
         const token = ethers.getAddress(log.address);
         if (FM_ONLY && !(await isFourMemeToken(token, provider))) {
           if (DBG_FM) console.log(`[skip] not Four Meme: ${token}`);
-              await tgDebug(`[SELL skip] not Four Meme: ${token}`);
+        await tgDebug(`[SELL skip] not Four Meme: ${token}`);
           return;
         }
         if (!(await isTokenOldEnough(token, provider, MIN_WEEKS))) return;
@@ -508,22 +642,16 @@ function subscribeForWallets(provider) {
         const k = keyFor(token, log.transactionHash, from, to, amount, 'SELL');
         if (seen.has(k)) return; if (seen.size > 5000) seen.clear(); seen.add(k);
         await sendSell({ token, symbol, name, amount, decimals, from, txHash: log.transactionHash });
-            console.log(`[SELL sent] ${symbol} amount=${ethers.formatUnits(amount, decimals)} tx=${log.transactionHash}`);
-            await tgDebug(`[SELL sent] ${symbol} amount=${ethers.formatUnits(amount, decimals)} tx=${log.transactionHash}`);
+      console.log(`[SELL sent] ${symbol} amount=${ethers.formatUnits(amount, decimals)} tx=${log.transactionHash}`);
+      await tgDebug(`[SELL sent] ${symbol} amount=${ethers.formatUnits(amount, decimals)} tx=${log.transactionHash}`);
       } catch (err) {
         console.error('sell handler error:', err.message);
       }
-      });
-      subCount++;
-    }, when + Math.floor(RATE_MS / 2));
-
-    i++;
+    });
+    subCount++;
   }
 
-  console.log(`Scheduling ${wallets.length} wallet subscriptions at ~${Math.round(1000 / RATE_MS) * 2}/sec…`);
-  setTimeout(() => {
-    console.log(`Subscribed ~${subCount} filters (expected ${wallets.length * 2}). Waiting for incoming ERC-20 transfers…`);
-  }, i * RATE_MS + 500);
+  console.log(`Subscribed to ${TRACK.size} wallet(s) with ${subCount} filters. Waiting for incoming ERC-20 transfers…`);
 }
 
 // Provider lifecycle with health-check & reconnect
