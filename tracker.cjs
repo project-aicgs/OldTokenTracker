@@ -28,7 +28,6 @@ const { walletLabels } = require('./wallets.cjs');
    DEBUG_TAP=false                 # Optional: global Transfer tap + block logs
    TAP_BLOCKS_BACK=20              # Optional: how many recent blocks to probe for logs
    TAP_SAMPLE_LIMIT=5              # Optional: sample size to print from recent logs
-   SUBSCRIBE_RATE=10               # Subscriptions per second (throttle per-wallet filters)
 */
 
 const {
@@ -38,9 +37,9 @@ const {
   BSCSCAN_API_KEY,
   HTTPS_RPC_URL = '',
   WALLETS,
-  MIN_TOKEN_AGE_DAYS = '1',
-  MIN_TOKEN_AGE_WEEKS = '0',
-  FOUR_MEME_ONLY = 'true',
+  MIN_TOKEN_AGE_DAYS = '0',
+  MIN_TOKEN_AGE_WEEKS = '1',
+  FOUR_MEME_ONLY = 'false',
   FM_PROXY = '0x5c952063c7fc8610FFDB798152D69F0B9550762b',
   BITQUERY_API_KEY = 'its ',
   DEBUG_AGE = 'false',
@@ -48,17 +47,16 @@ const {
   DEBUG_TG = 'false',
   DEBUG_TAP = 'false',
   TAP_BLOCKS_BACK = '20',
-  TAP_SAMPLE_LIMIT = '5',
-  SUBSCRIBE_RATE = '10'
+  TAP_SAMPLE_LIMIT = '5'
 } = process.env;
 
-if (!BOT_TOKEN || !CHAT_ID || !WSS_RPC_URL || !BSCSCAN_API_KEY) {
-  console.error('Missing env. Need BOT_TOKEN, CHAT_ID, WSS_RPC_URL, BSCSCAN_API_KEY');
+if (!BOT_TOKEN || !CHAT_ID || !WSS_RPC_URL || !HTTPS_RPC_URL) {
+  console.error('Missing env. Need BOT_TOKEN, CHAT_ID, WSS_RPC_URL, HTTPS_RPC_URL (archive)');
   process.exit(1);
 }
 
-const MIN_DAYS = parseFloat(MIN_TOKEN_AGE_DAYS) || 0;
-const MIN_WEEKS = parseFloat(MIN_TOKEN_AGE_WEEKS) || 0;
+const MIN_DAYS = Number(String(MIN_TOKEN_AGE_DAYS ?? '').trim() || '0');
+const MIN_WEEKS = Number(String(MIN_TOKEN_AGE_WEEKS ?? '').trim() || '0');
 const FM_ONLY = String(FOUR_MEME_ONLY).toLowerCase() === 'true';
 const DBG_AGE = String(DEBUG_AGE).toLowerCase() === 'true';
 const DBG_FM = String(DEBUG_FOURMEME).toLowerCase() === 'true';
@@ -66,8 +64,11 @@ const DBG_TG = String(DEBUG_TG).toLowerCase() === 'true';
 const DBG_TAP = String(DEBUG_TAP).toLowerCase() === 'true';
 const TAP_BACK = Math.max(0, parseInt(TAP_BLOCKS_BACK, 10) || 0);
 const TAP_SAMPLES = Math.max(0, parseInt(TAP_SAMPLE_LIMIT, 10) || 0);
-const SUBS_RATE = Math.max(1, parseInt(SUBSCRIBE_RATE, 10) || 10);
-const TRACK = new Set(Array.from(walletLabels.keys()));
+// Union env-provided wallets with local wallet file (minimal behavior change)
+const TRACK = new Set([
+  ...Array.from(walletLabels.keys()),
+  ...((WALLETS && WALLETS.trim()) ? WALLETS.split(',').map(s => s.trim().toLowerCase()).filter(Boolean) : [])
+]);
 
 // --- Telegram ---
 const bot = new Telegraf(BOT_TOKEN);
@@ -125,24 +126,64 @@ async function getCreationInfo(token, provider) {
     return cached;
   }
 
-  // -1) Archive RPC binary search (most reliable if HTTPS_RPC_URL is archive)
+  // 1) Prefer BscScan contract creation (fast) to get the block number, then fetch timestamp via QuickNode
+  try {
+    const url = `https://api.bscscan.com/api?module=contract&action=getcontractcreation&contractaddresses=${addr}&apikey=${BSCSCAN_API_KEY}`;
+    const res = await fetch(url);
+    const json = await res.json();
+    if (json.status === '1' && Array.isArray(json.result) && json.result.length) {
+      const row = json.result[0];
+      const blockNumber = parseInt(row.blockNumber, 10);
+      let timestamp = null;
+      try {
+        const useProvider = httpProvider || provider;
+        const block = await useProvider.getBlock(blockNumber);
+        timestamp = block?.timestamp ?? null;
+        if (DBG_AGE && timestamp) console.log(`[age] Provider block ts for ${addr}@${blockNumber} -> ${timestamp}`);
+        if (timestamp) await tgDebug(`[age] Provider block ts for ${addr}@${blockNumber} -> ${timestamp}`);
+      } catch (e) {
+        if (DBG_AGE) console.log(`[age] provider.getBlock failed for ${addr} @ ${blockNumber}: ${e.message}`);
+        await tgDebug(`[age] provider.getBlock failed for ${addr} @ ${blockNumber}: ${e.message}`);
+      }
+      if (!timestamp) {
+        try {
+          const r2 = await fetch(`https://api.bscscan.com/api?module=block&action=getblockreward&blockno=${blockNumber}&apikey=${BSCSCAN_API_KEY}`);
+          const j2 = await r2.json();
+          const tsStr = j2?.result?.timeStamp;
+          let ts = null;
+          if (typeof tsStr === 'string') {
+            if (/^0x/i.test(tsStr)) ts = Number(BigInt(tsStr)); else ts = parseInt(tsStr, 10);
+          }
+          if (Number.isFinite(ts)) {
+            timestamp = ts;
+            if (DBG_AGE) console.log(`[age] BscScan block ts for ${addr}@${blockNumber} -> ${timestamp}`);
+            await tgDebug(`[age] BscScan block ts for ${addr}@${blockNumber} -> ${timestamp}`);
+          }
+        } catch (e) {
+          if (DBG_AGE) console.log(`[age] BscScan timestamp fallback failed for ${addr} @ ${blockNumber}: ${e.message}`);
+          await tgDebug(`[age] BscScan timestamp fallback failed for ${addr} @ ${blockNumber}: ${e.message}`);
+        }
+      }
+      const info = { blockNumber, timestamp: timestamp ?? null, nextRetryAt: timestamp ? 0 : now + RETRY_MS };
+      createdCache.set(addr, info);
+      return info;
+    }
+  } catch (e) {
+    if (DBG_AGE) console.log(`[age] getcontractcreation failed for ${addr}: ${e.message}`);
+    await tgDebug(`[age] getcontractcreation failed for ${addr}: ${e.message}`);
+  }
+
+  // 2) Archive RPC binary search (QuickNode) as a fallback when BscScan does not return creation
   if (httpProvider) {
     try {
       const latest = await httpProvider.getBlockNumber();
-      // quick check: if code is empty at latest, this contract may be self-destructed or invalid
       const codeLatest = await httpProvider.getCode(addr, latest);
       if (codeLatest && codeLatest !== '0x') {
-        let low = 0;
-        let high = latest;
-        // Binary search for first block with non-empty code
+        let low = 0, high = latest;
         while (low < high) {
           const mid = Math.floor((low + high) / 2);
           const code = await httpProvider.getCode(addr, mid);
-          if (code && code !== '0x') {
-            high = mid; // code exists at mid -> go earlier
-          } else {
-            low = mid + 1; // no code yet -> go later
-          }
+          if (code && code !== '0x') high = mid; else low = mid + 1;
         }
         const firstBlock = low;
         const block = await httpProvider.getBlock(firstBlock);
@@ -161,7 +202,7 @@ async function getCreationInfo(token, provider) {
     }
   }
 
-  // 0) Bitquery primary (if available): get contract creation block/time
+  // 3) Bitquery (optional)
   if (BITQUERY_API_KEY) {
     try {
       const q = `
@@ -171,16 +212,10 @@ async function getCreationInfo(token, provider) {
               where: { Receipt: { ContractAddress: { is: $token } } }
               orderBy: { ascending: Block_Number }
               limit: { count: 1 }
-            ) {
-              Block { Number Time }
-            }
+            ) { Block { Number Time } }
           }
         }`;
-      const r = await fetch(BITQUERY_ENDPOINT, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${BITQUERY_API_KEY}` },
-        body: JSON.stringify({ query: q, variables: { token: addr } })
-      });
+      const r = await fetch(BITQUERY_ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${BITQUERY_API_KEY}` }, body: JSON.stringify({ query: q, variables: { token: addr } }) });
       const j = await r.json();
       const row = j?.data?.EVM?.Transactions?.[0];
       if (row?.Block?.Number && row?.Block?.Time) {
@@ -199,61 +234,6 @@ async function getCreationInfo(token, provider) {
       await tgDebug(`[age] Bitquery creation query failed for ${addr}: ${e.message}`);
     }
   }
-
-  const url = `https://api.bscscan.com/api?module=contract&action=getcontractcreation&contractaddresses=${addr}&apikey=${BSCSCAN_API_KEY}`;
-  try {
-    const res = await fetch(url);
-    const json = await res.json();
-    if (json.status === '1' && Array.isArray(json.result) && json.result.length) {
-      const row = json.result[0];
-      const blockNumber = parseInt(row.blockNumber, 10);
-      let timestamp = null;
-      // Try provider first (can fail on some WS providers for historical blocks)
-      try {
-        const useProvider = httpProvider || provider;
-        const block = await useProvider.getBlock(blockNumber);
-        timestamp = block?.timestamp ?? null;
-        if (DBG_AGE && timestamp) console.log(`[age] Provider block ts for ${addr}@${blockNumber} -> ${timestamp}`);
-        if (timestamp) await tgDebug(`[age] Provider block ts for ${addr}@${blockNumber} -> ${timestamp}`);
-      } catch (e) {
-        if (DBG_AGE) console.log(`[age] provider.getBlock failed for ${addr} @ ${blockNumber}: ${e.message}`);
-        await tgDebug(`[age] provider.getBlock failed for ${addr} @ ${blockNumber}: ${e.message}`);
-      }
-      // Fallback to BscScan for block timestamp
-      if (!timestamp) {
-        try {
-          const r2 = await fetch(`https://api.bscscan.com/api?module=block&action=getblockreward&blockno=${blockNumber}&apikey=${BSCSCAN_API_KEY}`);
-          const j2 = await r2.json();
-          const tsStr = j2?.result?.timeStamp;
-          let ts = null;
-          if (typeof tsStr === 'string') {
-            if (/^0x/i.test(tsStr)) {
-              ts = Number(BigInt(tsStr)); // hex -> number
-            } else {
-              ts = parseInt(tsStr, 10);
-            }
-          }
-          if (Number.isFinite(ts)) {
-            timestamp = ts;
-            if (DBG_AGE) console.log(`[age] BscScan block ts for ${addr}@${blockNumber} -> ${timestamp}`);
-            await tgDebug(`[age] BscScan block ts for ${addr}@${blockNumber} -> ${timestamp}`);
-          } else {
-            if (DBG_AGE) console.log(`[age] BscScan block ts parse failed for ${addr}@${blockNumber}: ${JSON.stringify(j2?.result)}`);
-            await tgDebug(`[age] BscScan block ts parse failed for ${addr}@${blockNumber}`);
-          }
-        } catch (e) {
-          if (DBG_AGE) console.log(`[age] BscScan timestamp fallback failed for ${addr} @ ${blockNumber}: ${e.message}`);
-          await tgDebug(`[age] BscScan timestamp fallback failed for ${addr} @ ${blockNumber}: ${e.message}`);
-        }
-      }
-      const info = { blockNumber, timestamp: timestamp ?? null, nextRetryAt: timestamp ? 0 : now + RETRY_MS };
-      createdCache.set(addr, info);
-      return info;
-    }
-  } catch (e) {
-    if (DBG_AGE) console.log(`[age] getcontractcreation failed for ${addr}: ${e.message}`);
-    await tgDebug(`[age] getcontractcreation failed for ${addr}: ${e.message}`);
-  }
   const info = { blockNumber: null, timestamp: null, nextRetryAt: now + RETRY_MS };
   createdCache.set(addr, info);
   return info;
@@ -262,11 +242,11 @@ async function getCreationInfo(token, provider) {
 async function isTokenOldEnough(token, provider, minWeeks) {
   // Prefer days if provided; else use weeks
   const minDays = MIN_DAYS;
-  const useWeeks = !minDays || minDays <= 0;
+  const useWeeks = !(Number.isFinite(minDays) && minDays > 0);
   const minReqSecs = useWeeks
-    ? (minWeeks || 0) * 7 * 24 * 3600
+    ? (Number.isFinite(minWeeks) ? minWeeks : 0) * 7 * 24 * 3600
     : minDays * 24 * 3600;
-  if (minReqSecs <= 0) return true;
+  if (!Number.isFinite(minReqSecs) || minReqSecs <= 0) return true;
   const cr = await getCreationInfo(token, provider);
   if (!cr.timestamp) {
     if (DBG_AGE) console.log(`[age] ${token} -> unknown age (blocking, retry after ${new Date(cr.nextRetryAt).toISOString()})`);
@@ -390,8 +370,27 @@ async function sendBuy({ token, symbol, name, amount, decimals, to, txHash, mcap
     `[View Tx](https://bscscan.com/tx/${txHash})`,
     `[Token Page](https://bscscan.com/token/${token})`
   ].filter(Boolean).join('\n');
-
-  await bot.telegram.sendMessage(CHAT_ID, text, { parse_mode: 'MarkdownV2', disable_web_page_preview: true });
+  try {
+    await bot.telegram.sendMessage(CHAT_ID, text, { parse_mode: 'MarkdownV2', disable_web_page_preview: true });
+  } catch (e) {
+    console.error('sendBuy markdown error:', e?.response?.description || e.message);
+    // Fallback: send plain text without markdown in case of parse issues
+    const plain = [
+      `${label} bought ${symbol}`,
+      `Token: ${symbol} - ${name}`,
+      `Contract: ${token}`,
+      `Amount: ${human}`,
+      `Wallet: https://bscscan.com/address/${to}`,
+      mcapUsd ? `MCap: $${mcapUsd}` : null,
+      `Tx: https://bscscan.com/tx/${txHash}`,
+      `Token: https://bscscan.com/token/${token}`
+    ].filter(Boolean).join('\n');
+    try {
+      await bot.telegram.sendMessage(CHAT_ID, plain, { disable_web_page_preview: true });
+    } catch (e2) {
+      console.error('sendBuy plain error:', e2?.response?.description || e2.message);
+    }
+  }
 }
 
 async function sendSell({ token, symbol, name, amount, decimals, from, txHash }) {
@@ -408,26 +407,40 @@ async function sendSell({ token, symbol, name, amount, decimals, from, txHash })
     `[View Tx](https://bscscan.com/tx/${txHash})`,
     `[Token Page](https://bscscan.com/token/${token})`
   ].join('\n');
-
-  await bot.telegram.sendMessage(CHAT_ID, text, { parse_mode: 'MarkdownV2', disable_web_page_preview: true });
+  try {
+    await bot.telegram.sendMessage(CHAT_ID, text, { parse_mode: 'MarkdownV2', disable_web_page_preview: true });
+  } catch (e) {
+    console.error('sendSell markdown error:', e?.response?.description || e.message);
+    const plain = [
+      `${label} sold ${symbol}`,
+      `Token: ${symbol} - ${name}`,
+      `Contract: ${token}`,
+      `Amount: ${human}`,
+      `From: https://bscscan.com/address/${from}`,
+      `Tx: https://bscscan.com/tx/${txHash}`,
+      `Token: https://bscscan.com/token/${token}`
+    ].join('\n');
+    try {
+      await bot.telegram.sendMessage(CHAT_ID, plain, { disable_web_page_preview: true });
+    } catch (e2) {
+      console.error('sendSell plain error:', e2?.response?.description || e2.message);
+    }
+  }
 }
 
 // Subscribe handlers
 function subscribeForWallets(provider) {
-  // Revert to per-wallet subscriptions, throttled to avoid provider limits
+  // Simple per-wallet subscriptions (original working logic)
   const wallets = Array.from(TRACK);
-  const delayMs = Math.floor(1000 / SUBS_RATE);
-  let idx = 0;
   let subCount = 0;
 
   for (const w of wallets) {
-    const when = idx * delayMs;
     const addr32 = ethers.zeroPadValue(ethers.getAddress(w), 32);
-    setTimeout(() => {
-      // BUY = to == wallet
-      const buyFilter = { address: undefined, topics: [ TRANSFER_TOPIC, null, addr32 ] };
-      console.log(`[sub] BUY filter for ${w} at +${when}ms`);
-      provider.on(buyFilter, async (log) => {
+
+    // BUY = to == wallet
+    const buyFilter = { address: undefined, topics: [ TRANSFER_TOPIC, null, addr32 ] };
+    console.log(`[sub] BUY filter for ${w}`);
+    provider.on(buyFilter, async (log) => {
     try {
       console.log(`[BUY event] token=${log.address}, tx=${log.transactionHash}`);
       await tgDebug(`[BUY event] token=${log.address}, tx=${log.transactionHash}`);
@@ -462,13 +475,13 @@ function subscribeForWallets(provider) {
     } catch (err) {
           console.error('buy handler error:', err.message);
     }
-      });
-      subCount++;
+    });
+    subCount++;
 
-      // SELL = from == wallet
-      const sellFilter = { address: undefined, topics: [ TRANSFER_TOPIC, addr32, null ] };
-      console.log(`[sub] SELL filter for ${w} at +${when}ms`);
-      provider.on(sellFilter, async (log) => {
+    // SELL = from == wallet
+    const sellFilter = { address: undefined, topics: [ TRANSFER_TOPIC, addr32, null ] };
+    console.log(`[sub] SELL filter for ${w}`);
+    provider.on(sellFilter, async (log) => {
     try {
       console.log(`[SELL event] token=${log.address}, tx=${log.transactionHash}`);
       await tgDebug(`[SELL event] token=${log.address}, tx=${log.transactionHash}`);
@@ -494,17 +507,11 @@ function subscribeForWallets(provider) {
     } catch (err) {
           console.error('sell handler error:', err.message);
     }
-      });
-      subCount++;
-    }, when);
-    idx++;
+    });
+    subCount++;
   }
 
-  console.log(`Scheduling subscriptions for ${TRACK.size} wallet(s) at ${SUBS_RATE}/sec (${delayMs}ms spacing)…`);
-  // Report final sub count after the last timer should have fired
-  setTimeout(() => {
-    console.log(`Subscribed with ~${subCount} active filters (expected ${TRACK.size * 2}). Waiting for incoming ERC-20 transfers…`);
-  }, (idx + 1) * delayMs + 500);
+  console.log(`Subscribed to ${TRACK.size} wallet(s) with ${subCount} filters. Waiting for incoming ERC-20 transfers…`);
 }
 
 // Provider lifecycle with health-check & reconnect
