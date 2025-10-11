@@ -433,7 +433,7 @@ function subscribeForWallets(provider) {
   // Simple per-wallet subscriptions (original working logic)
   const wallets = Array.from(TRACK);
   let subCount = 0;
-  const RATE_MS = 150; // ~13.3 subs/sec (2 per wallet), under QuickNode 15/sec limit
+  const RATE_MS = 300; // ~6.6 wallets/sec; with staggered BUY/SELL -> ~6.6*2=13.3 subs/sec
   let i = 0;
 
   for (const w of wallets) {
@@ -482,10 +482,14 @@ function subscribeForWallets(provider) {
     });
       subCount++;
 
-    // SELL = from == wallet
-    const sellFilter = { address: undefined, topics: [ TRANSFER_TOPIC, addr32, null ] };
-      console.log(`[sub] SELL filter for ${w} (+${when}ms)`);
-    provider.on(sellFilter, async (log) => {
+    }, when);
+
+    // Stagger SELL half-interval after BUY to smooth bursts
+    setTimeout(() => {
+      // SELL = from == wallet
+      const sellFilter = { address: undefined, topics: [ TRANSFER_TOPIC, addr32, null ] };
+      console.log(`[sub] SELL filter for ${w} (+${when + Math.floor(RATE_MS/2)}ms)`);
+      provider.on(sellFilter, async (log) => {
       try {
             console.log(`[SELL event] token=${log.address}, tx=${log.transactionHash}`);
             await tgDebug(`[SELL event] token=${log.address}, tx=${log.transactionHash}`);
@@ -511,9 +515,9 @@ function subscribeForWallets(provider) {
       } catch (err) {
         console.error('sell handler error:', err.message);
       }
-    });
+      });
       subCount++;
-    }, when);
+    }, when + Math.floor(RATE_MS / 2));
 
     i++;
   }
