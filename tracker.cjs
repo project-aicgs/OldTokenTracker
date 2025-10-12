@@ -114,6 +114,16 @@ const BASE_TOKENS = {
   '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d': { symbol: 'USDC', decimals: 18 }
 };
 
+// Token blacklist (lowercased addresses)
+const TOKEN_BLACKLIST = new Set([
+  '0x2170ed0880ac9a755fd29b2688956bd959f933f8', // ETH (Binance-Peg)
+  '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d', // USDC
+  '0x55d398326f99059ff775485246999027b3197955'  // USDT
+]);
+
+// Market cap filter (USD), skip tokens above this cap
+const MAX_MCAP_USD = Math.max(0, parseFloat(process.env.MAX_MCAP_USD || '200000'));
+
 async function detectSpent(provider, txHash, trackedFrom) {
   try {
     const [tx, receipt] = await Promise.all([
@@ -183,17 +193,22 @@ async function detectReceivedBase(provider, txHash, trackedTo) {
   }
 }
 
-async function fetchMcapUsd(token) {
+async function getMcapNumber(token) {
   try {
     const ds = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${token}`).then(r => r.json());
     const pairs = Array.isArray(ds?.pairs) ? ds.pairs : [];
     const top = pairs[0];
     const mcap = top?.fdv || top?.marketCap;
-    if (mcap && Number.isFinite(Number(mcap))) return fmt2(Number(mcap));
+    if (mcap && Number.isFinite(Number(mcap))) return Number(mcap);
   } catch (e) {
     if (DBG_V) dbg('mcap.error', e.message);
   }
   return null;
+}
+
+async function fetchMcapUsd(token) {
+  const n = await getMcapNumber(token);
+  return n == null ? null : fmt2(n);
 }
 
 // Fail fast if chat is wrong (so you don’t miss alerts later)
@@ -510,7 +525,7 @@ async function sendBuy({ token, symbol, name, amount, decimals, to, txHash, crea
       `${label} bought ${symbol}`,
       `Token: ${symbol} - ${name}`,
       `Contract: ${token}`,
-      `Amount: ${human}`,
+      `Amount: ${humanNum}`,
       `Wallet: https://bscscan.com/address/${to}`,
       mcapUsd ? `MCap: $${mcapUsd}` : null,
       `Tx: https://bscscan.com/tx/${txHash}`,
@@ -547,7 +562,7 @@ async function sendSell({ token, symbol, name, amount, decimals, from, txHash, c
       `${label} sold ${symbol}`,
       `Token: ${symbol} - ${name}`,
       `Contract: ${token}`,
-      `Amount: ${human}`,
+      `Amount: ${humanNum}`,
       `From: https://bscscan.com/address/${from}`,
       `Tx: https://bscscan.com/tx/${txHash}`,
       `Token: https://bscscan.com/token/${token}`
@@ -584,6 +599,7 @@ function subscribeForWallets(provider) {
         if (!TRACK.has(to.toLowerCase())) return;
 
         const token = ethers.getAddress(log.address);
+        if (TOKEN_BLACKLIST.has(token.toLowerCase())) { if (DBG_V) dbg('buy.skip', `blacklisted ${token}`); return; }
         if (FM_ONLY) {
           const fm = await isFourMemeToken(token, provider);
           if (DBG_V) dbg('buy.fm', `FM_ONLY=${FM_ONLY} isFM=${fm}`);
@@ -594,6 +610,10 @@ function subscribeForWallets(provider) {
         if (!ageOk) return;
 
         const { symbol, name, decimals } = await getTokenMeta(token, provider);
+        if (MAX_MCAP_USD > 0) {
+          const mcapNum = await getMcapNumber(token);
+          if (mcapNum != null && mcapNum > MAX_MCAP_USD) { if (DBG_V) dbg('buy.skip', `mcap>${MAX_MCAP_USD} (${mcapNum}) ${token}`); return; }
+        }
         if (DBG_V) dbg('buy.meta', `symbol=${symbol} name=${name} decimals=${decimals}`);
         const amount = ethers.getBigInt(log.data);
         const k = keyFor(token, log.transactionHash, from, to, amount, 'BUY');
@@ -618,6 +638,7 @@ function subscribeForWallets(provider) {
         if (!TRACK.has(from.toLowerCase())) return;
 
         const token = ethers.getAddress(log.address);
+        if (TOKEN_BLACKLIST.has(token.toLowerCase())) { if (DBG_V) dbg('sell.skip', `blacklisted ${token}`); return; }
         if (FM_ONLY) {
           const fm = await isFourMemeToken(token, provider);
           if (DBG_V) dbg('sell.fm', `FM_ONLY=${FM_ONLY} isFM=${fm}`);
@@ -628,6 +649,10 @@ function subscribeForWallets(provider) {
         if (!ageOk) return;
 
         const { symbol, name, decimals } = await getTokenMeta(token, provider);
+        if (MAX_MCAP_USD > 0) {
+          const mcapNum = await getMcapNumber(token);
+          if (mcapNum != null && mcapNum > MAX_MCAP_USD) { if (DBG_V) dbg('sell.skip', `mcap>${MAX_MCAP_USD} (${mcapNum}) ${token}`); return; }
+        }
         if (DBG_V) dbg('sell.meta', `symbol=${symbol} name=${name} decimals=${decimals}`);
         const amount = ethers.getBigInt(log.data);
         const k = keyFor(token, log.transactionHash, from, to, amount, 'SELL');
