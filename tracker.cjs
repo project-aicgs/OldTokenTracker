@@ -498,11 +498,13 @@ function keyFor(token, txHash, from, to, value, side) {
 }
 
 // Telegram sends
-async function sendBuy({ token, symbol, name, amount, decimals, to, txHash, creationTs }) {
+async function sendBuy({ token, symbol, name, amount, decimals, to, txHash, creationTs, spent }) {
   const humanNum = Number(ethers.formatUnits(amount, decimals));
   const label = walletLabels.get(to.toLowerCase()) || to;
   const labelLink = `[${esc(label)}](https://bscscan.com/address/${to})`;
-  const spent = await detectReceivedBase(httpProvider || provider, txHash, to);
+  if (!spent) {
+    spent = await detectSpent(httpProvider || provider, txHash, to);
+  }
   const mcapUsd = await fetchMcapUsd(token);
   const ageStr = formatAgeDays(creationTs);
 
@@ -539,11 +541,13 @@ async function sendBuy({ token, symbol, name, amount, decimals, to, txHash, crea
   }
 }
 
-async function sendSell({ token, symbol, name, amount, decimals, from, txHash, creationTs }) {
+async function sendSell({ token, symbol, name, amount, decimals, from, txHash, creationTs, spent }) {
   const humanNum = Number(ethers.formatUnits(amount, decimals));
   const label = walletLabels.get(from.toLowerCase()) || from;
   const labelLink = `[${esc(label)}](https://bscscan.com/address/${from})`;
-  const spent = await detectSpent(httpProvider || provider, txHash, from);
+  if (!spent) {
+    spent = await detectReceivedBase(httpProvider || provider, txHash, from);
+  }
   const ageStr = formatAgeDays(creationTs);
   const sentence = `*${esc(label)}* sold *${esc(fmt2(humanNum))}* *${esc(symbol)}*${spent ? ` for *${esc(fmt2(spent.amount))}* ${esc(spent.symbol)}` : ''}`;
   const details = [
@@ -597,6 +601,12 @@ function subscribeForWallets(provider) {
         const to   = ethers.getAddress(ethers.dataSlice(log.topics[2], 12));
         if (DBG_V) dbg('buy.roles', `from=${from} to=${to} tracked=${TRACK.has(to.toLowerCase())}`);
         if (!TRACK.has(to.toLowerCase())) return;
+        // Require the tracked wallet to be the transaction sender to avoid airdrops
+        try {
+          const tx = await provider.getTransaction(log.transactionHash);
+          const txFrom = tx && tx.from ? ethers.getAddress(tx.from) : null;
+          if (!txFrom || txFrom !== to) { if (DBG_V) dbg('buy.skip', `not tx sender (tx.from=${txFrom}, wallet=${to})`); return; }
+        } catch (e) { if (DBG_V) dbg('buy.txFetch.error', e.message); return; }
 
         const token = ethers.getAddress(log.address);
         if (TOKEN_BLACKLIST.has(token.toLowerCase())) { if (DBG_V) dbg('buy.skip', `blacklisted ${token}`); return; }
@@ -636,6 +646,12 @@ function subscribeForWallets(provider) {
         const to   = ethers.getAddress(ethers.dataSlice(log.topics[2], 12));
         if (DBG_V) dbg('sell.roles', `from=${from} to=${to} tracked=${TRACK.has(from.toLowerCase())}`);
         if (!TRACK.has(from.toLowerCase())) return;
+        // Require the tracked wallet to be the transaction sender to avoid airdrops
+        try {
+          const tx = await provider.getTransaction(log.transactionHash);
+          const txFrom = tx && tx.from ? ethers.getAddress(tx.from) : null;
+          if (!txFrom || txFrom !== from) { if (DBG_V) dbg('sell.skip', `not tx sender (tx.from=${txFrom}, wallet=${from})`); return; }
+        } catch (e) { if (DBG_V) dbg('sell.txFetch.error', e.message); return; }
 
         const token = ethers.getAddress(log.address);
         if (TOKEN_BLACKLIST.has(token.toLowerCase())) { if (DBG_V) dbg('sell.skip', `blacklisted ${token}`); return; }
