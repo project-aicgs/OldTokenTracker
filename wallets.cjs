@@ -6,6 +6,7 @@ const walletLabels = new Map([
   ['0x977524bcadadde3e0d8ea186c036278e5a7c2afe', 'PossibleAlpha1'],
   ['0xd911f6e80158b18bf82c08418af40483dce0f37d', 'Glaucus'],
   ['0xa7d4ffc4eca3c71af150ce302560a9d04a1d2b9f','CryptoSaba'],
+  ['0xfedd5e113b3f9806a595ac72ef0871aff2ab4d7f', 'Rabbit'],
   ['0x00567d0e8187ee3ae5ea55b531fd436266b15d9e', 'facairiji'],
   ['0x0128550175d457e1095b3d9e18a1513e32a9bc54', 'base75'],
   ['0x04e6f2dd673fd089395b4ef7c3111da739826a62', 'apestoreinsider'],
