@@ -256,60 +256,8 @@ async function getCreationInfo(token, provider) {
     return cached;
   }
 
-  // 1) Prefer BscScan contract creation (fast) to get the block number, then fetch timestamp via QuickNode
-  try {
-    const url = `https://api.bscscan.com/api?module=contract&action=getcontractcreation&contractaddresses=${addr}&apikey=${BSCSCAN_API_KEY}`;
-    const res = await fetch(url);
-    const json = await res.json();
-    if (DBG_V) dbg('age.query', `bscscan status=${json.status} message=${json.message}`);
-    if (json.status === '1' && Array.isArray(json.result) && json.result.length) {
-      const row = json.result[0];
-      const blockNumber = parseInt(row.blockNumber, 10);
-      if (DBG_V) dbg('age.block', `creationBlock=${blockNumber}`);
-      let timestamp = null;
-      try {
-        const useProvider = httpProvider || provider;
-        if (QN_PACE_MS) await new Promise(r => setTimeout(r, QN_PACE_MS));
-        const block = await useProvider.getBlock(blockNumber);
-        timestamp = block?.timestamp ?? null;
-        if (DBG_V) dbg('age.ts.provider', `ts=${timestamp}`);
-        if (DBG_AGE && timestamp) console.log(`[age] Provider block ts for ${addr}@${blockNumber} -> ${timestamp}`);
-        if (timestamp) await tgDebug(`[age] Provider block ts for ${addr}@${blockNumber} -> ${timestamp}`);
-      } catch (e) {
-        if (DBG_AGE) console.log(`[age] provider.getBlock failed for ${addr} @ ${blockNumber}: ${e.message}`);
-        if (DBG_V) dbg('age.ts.provider.error', e.message);
-        await tgDebug(`[age] provider.getBlock failed for ${addr} @ ${blockNumber}: ${e.message}`);
-      }
-      if (!timestamp) {
-        try {
-          const r2 = await fetch(`https://api.bscscan.com/api?module=block&action=getblockreward&blockno=${blockNumber}&apikey=${BSCSCAN_API_KEY}`);
-          const j2 = await r2.json();
-          const tsStr = j2?.result?.timeStamp;
-          let ts = null;
-          if (typeof tsStr === 'string') {
-            if (/^0x/i.test(tsStr)) ts = Number(BigInt(tsStr)); else ts = parseInt(tsStr, 10);
-          }
-          if (Number.isFinite(ts)) {
-            timestamp = ts;
-            if (DBG_V) dbg('age.ts.bscscan', `ts=${timestamp}`);
-            if (DBG_AGE) console.log(`[age] BscScan block ts for ${addr}@${blockNumber} -> ${timestamp}`);
-            await tgDebug(`[age] BscScan block ts for ${addr}@${blockNumber} -> ${timestamp}`);
-          }
-        } catch (e) {
-          if (DBG_AGE) console.log(`[age] BscScan timestamp fallback failed for ${addr} @ ${blockNumber}: ${e.message}`);
-          if (DBG_V) dbg('age.ts.bscscan.error', e.message);
-          await tgDebug(`[age] BscScan timestamp fallback failed for ${addr} @ ${blockNumber}: ${e.message}`);
-        }
-      }
-      const info = { blockNumber, timestamp: timestamp ?? null, nextRetryAt: timestamp ? 0 : now + RETRY_MS };
-      createdCache.set(addr, info);
-      return info;
-    }
-  } catch (e) {
-    if (DBG_AGE) console.log(`[age] getcontractcreation failed for ${addr}: ${e.message}`);
-    if (DBG_V) dbg('age.query.error', e.message);
-    await tgDebug(`[age] getcontractcreation failed for ${addr}: ${e.message}`);
-  }
+  // QuickNode-only age lookup (BscScan disabled)
+  if (DBG_V) dbg('age.source', 'quicknode_only');
 
   // 2) Archive RPC binary search (QuickNode) as a fallback when BscScan does not return creation
   if (httpProvider) {
@@ -347,38 +295,7 @@ async function getCreationInfo(token, provider) {
     }
   }
 
-  // 3) Bitquery (optional)
-  if (BITQUERY_API_KEY) {
-    try {
-      const q = `
-        query FirstCreation($token: String!) {
-          EVM(network: bsc, dataset: combined) {
-            Transactions(
-              where: { Receipt: { ContractAddress: { is: $token } } }
-              orderBy: { ascending: Block_Number }
-              limit: { count: 1 }
-            ) { Block { Number Time } }
-          }
-        }`;
-      const r = await fetch(BITQUERY_ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${BITQUERY_API_KEY}` }, body: JSON.stringify({ query: q, variables: { token: addr } }) });
-      const j = await r.json();
-      const row = j?.data?.EVM?.Transactions?.[0];
-      if (row?.Block?.Number && row?.Block?.Time) {
-        const blockNumber = Number(row.Block.Number);
-        const timestamp = Math.floor(new Date(row.Block.Time).getTime() / 1000);
-        if (Number.isFinite(blockNumber) && Number.isFinite(timestamp)) {
-          if (DBG_AGE) console.log(`[age] Bitquery creation for ${addr} -> block=${blockNumber}, ts=${timestamp}`);
-          await tgDebug(`[age] Bitquery creation for ${addr} -> block=${blockNumber}, ts=${timestamp}`);
-          const info = { blockNumber, timestamp, nextRetryAt: 0 };
-          createdCache.set(addr, info);
-          return info;
-        }
-      }
-    } catch (e) {
-      if (DBG_AGE) console.log(`[age] Bitquery creation query failed for ${addr}: ${e.message}`);
-      await tgDebug(`[age] Bitquery creation query failed for ${addr}: ${e.message}`);
-    }
-  }
+  // Bitquery disabled
   const info = { blockNumber: null, timestamp: null, nextRetryAt: now + RETRY_MS };
   createdCache.set(addr, info);
   return info;
@@ -499,6 +416,25 @@ function keyFor(token, txHash, from, to, value, side) {
   return `${token}:${txHash}:${from}:${to}:${value.toString()}:${side}`;
 }
 
+// Cache management - prevent memory leaks
+function checkCacheSizes() {
+  if (metaCache.size > 10000) {
+    console.log('[cache] Clearing metaCache (size exceeded 10000)');
+    metaCache.clear();
+  }
+  if (createdCache.size > 10000) {
+    console.log('[cache] Clearing createdCache (size exceeded 10000)');
+    createdCache.clear();
+  }
+  if (fourCache.size > 10000) {
+    console.log('[cache] Clearing fourCache (size exceeded 10000)');
+    fourCache.clear();
+  }
+}
+
+// Run cache cleanup every 30 minutes
+setInterval(checkCacheSizes, 30 * 60 * 1000);
+
 // Telegram sends
 async function sendBuy({ token, symbol, name, amount, decimals, to, txHash, creationTs, spent }) {
   const humanNum = Number(ethers.formatUnits(amount, decimals));
@@ -603,15 +539,16 @@ function subscribeForWallets(provider) {
         const to   = ethers.getAddress(ethers.dataSlice(log.topics[2], 12));
         if (DBG_V) dbg('buy.roles', `from=${from} to=${to} tracked=${TRACK.has(to.toLowerCase())}`);
         if (!TRACK.has(to.toLowerCase())) return;
-        // Require the tracked wallet to be the transaction sender to avoid airdrops
-        try {
-          const tx = await provider.getTransaction(log.transactionHash);
-          const txFrom = tx && tx.from ? ethers.getAddress(tx.from) : null;
-          if (!txFrom || txFrom !== to) { if (DBG_V) dbg('buy.skip', `not tx sender (tx.from=${txFrom}, wallet=${to})`); return; }
-        } catch (e) { if (DBG_V) dbg('buy.txFetch.error', e.message); return; }
 
         const token = ethers.getAddress(log.address);
         if (TOKEN_BLACKLIST.has(token.toLowerCase())) { if (DBG_V) dbg('buy.skip', `blacklisted ${token}`); return; }
+        
+        // Check if wallet spent base tokens (filters out airdrops efficiently)
+        const spent = await detectSpent(httpProvider || provider, log.transactionHash, to);
+        if (!spent || spent.amount <= 0) { 
+          if (DBG_V) dbg('buy.skip', 'no base token spent - likely airdrop'); 
+          return; 
+        }
         if (FM_ONLY) {
           const fm = await isFourMemeToken(token, provider);
           if (DBG_V) dbg('buy.fm', `FM_ONLY=${FM_ONLY} isFM=${fm}`);
@@ -631,7 +568,7 @@ function subscribeForWallets(provider) {
         const k = keyFor(token, log.transactionHash, from, to, amount, 'BUY');
         if (seen.has(k)) return; if (seen.size > 5000) seen.clear(); seen.add(k);
         const cr = createdCache.get(token) || {};
-        await sendBuy({ token, symbol, name, amount, decimals, to, txHash: log.transactionHash, creationTs: cr.timestamp || null });
+        await sendBuy({ token, symbol, name, amount, decimals, to, txHash: log.transactionHash, creationTs: cr.timestamp || null, spent });
       } catch (err) {
         console.error('buy handler error:', err.message);
         if (DBG_V) dbg('buy.error', err.stack || err.message);
@@ -648,12 +585,6 @@ function subscribeForWallets(provider) {
         const to   = ethers.getAddress(ethers.dataSlice(log.topics[2], 12));
         if (DBG_V) dbg('sell.roles', `from=${from} to=${to} tracked=${TRACK.has(from.toLowerCase())}`);
         if (!TRACK.has(from.toLowerCase())) return;
-        // Require the tracked wallet to be the transaction sender to avoid airdrops
-        try {
-          const tx = await provider.getTransaction(log.transactionHash);
-          const txFrom = tx && tx.from ? ethers.getAddress(tx.from) : null;
-          if (!txFrom || txFrom !== from) { if (DBG_V) dbg('sell.skip', `not tx sender (tx.from=${txFrom}, wallet=${from})`); return; }
-        } catch (e) { if (DBG_V) dbg('sell.txFetch.error', e.message); return; }
 
         const token = ethers.getAddress(log.address);
         if (TOKEN_BLACKLIST.has(token.toLowerCase())) { if (DBG_V) dbg('sell.skip', `blacklisted ${token}`); return; }
@@ -827,6 +758,17 @@ async function buildProvider() {
 
   subscribeForWallets(provider);
 
+  // Add WebSocket error handlers for better reliability
+  provider.websocket.on('error', (error) => {
+    console.error('WebSocket error:', error);
+    failures = 2; // Force immediate rebuild
+  });
+
+  provider.websocket.on('close', () => {
+    console.error('WebSocket closed unexpectedly');
+    failures = 2; // Force immediate rebuild
+  });
+
   // Global taps when enabled
   if (DBG_TAP) {
     try {
@@ -891,6 +833,17 @@ async function buildProvider() {
     }
   }, 30_000);
 }
+
+// Global error handlers to prevent crashes
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  // Don't exit, just log
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error);
+  process.exit(1); // Let Render restart
+});
 
 // Boot
 (async () => {
