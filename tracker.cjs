@@ -33,6 +33,7 @@ const { walletLabels } = require('./wallets.cjs');
    ATTACH_SPACING_MS=250           # Optional: ms spacing between chunk attaches
    BACKFILL_BLOCKS=25              # Optional: backfill last N blocks per chunk after subscribe
    QUICKNODE_PACE_MS=100           # Optional: min ms between HTTPS RPC calls (rate-limit)
+   RESTART_INTERVAL_MIN=60         # Optional: exit every N minutes so Render restarts (1h default)
 */
 
 const {
@@ -77,6 +78,7 @@ if (DBG_V && _RAW_BF > _BF_LIMIT) {
   console.log(`[backfill.cap] requested=${_RAW_BF} capped=${BF_BLOCKS}`);
 }
 const QN_PACE_MS = Math.max(0, parseInt(process.env.QUICKNODE_PACE_MS || '100', 10));
+const RESTART_INTERVAL_MIN = Math.max(0, parseInt(process.env.RESTART_INTERVAL_MIN || '60', 10));
 const TAP_BACK = Math.max(0, parseInt(TAP_BLOCKS_BACK, 10) || 0);
 const TAP_SAMPLES = Math.max(0, parseInt(TAP_SAMPLE_LIMIT, 10) || 0);
 // Prefer env-provided wallets; fallback to local wallet file
@@ -894,4 +896,15 @@ async function buildProvider() {
 (async () => {
   await assertChat();      // ensures CHAT_ID is correct
   await buildProvider();   // connect & subscribe
+
+  // Scheduled self-restart so Render restarts the worker (acts like redeploy)
+  if (RESTART_INTERVAL_MIN > 0) {
+    const ms = RESTART_INTERVAL_MIN * 60 * 1000;
+    console.log(`[restart] Scheduled exit in ${RESTART_INTERVAL_MIN} minute(s) to auto-restart on Render`);
+    setTimeout(async () => {
+      try { await tgDebug(`[restart] Interval reached (${RESTART_INTERVAL_MIN}m). Exiting for Render restart.`); } catch {}
+      console.error(`[restart] Interval reached. Exiting now.`);
+      process.exit(1); // non-zero -> Render restarts the service
+    }, ms);
+  }
 })();
